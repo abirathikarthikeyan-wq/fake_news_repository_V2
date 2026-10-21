@@ -109,28 +109,48 @@ async function extractArticle(rawUrl: string): Promise<{ finalUrl: string; title
   return null;
 }
 
-async function searchBrave(query: string): Promise<Evidence[]> {
-  const key = process.env.BRAVE_SEARCH_API_KEY;
+async function searchLangSearch(query: string): Promise<Evidence[]> {
+  const key = process.env.LANGSEARCH_API_KEY;
   if (!key || !query) return [];
-  const url = new URL("https://api.search.brave.com/res/v1/web/search");
-  url.searchParams.set("q", query.slice(0, 400));
-  url.searchParams.set("count", "5");
-  const response = await fetch(url, {
-    headers: { "Accept": "application/json", "X-Subscription-Token": key },
-    cache: "no-store",
-    signal: AbortSignal.timeout(7000)
-  });
-  if (!response.ok) return [];
-  const data = await response.json();
-  return (data.web?.results ?? []).slice(0, 5).map((item: any) => ({
-    title: String(item.title ?? "Search result").slice(0, 300),
-    url: String(item.url ?? ""),
-    description: String(item.description ?? "").slice(0, 700),
-    age: typeof item.age === "string" ? item.age : undefined,
-    source: "Brave Search"
-  })).filter((item: Evidence) => {
-    try { return ["http:", "https:"].includes(new URL(item.url).protocol); } catch { return false; }
-  });
+
+  try {
+    const response = await fetch("https://api.langsearch.com/v1/web-search", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${key}`,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify({ query: query.slice(0, 800), count: 5 }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (!response.ok) {
+      console.error("LangSearch API returned status", response.status);
+      return [];
+    }
+    const payload = await response.json();
+    if (String(payload.code) !== "200") {
+      console.error("LangSearch API error:", payload.message ?? "Unknown error");
+      return [];
+    }
+
+    const pages = payload.data?.webPages?.value ?? [];
+    return pages.slice(0, 5).map((item: any) => ({
+      title: String(item.name ?? "Search result").slice(0, 300),
+      url: String(item.url ?? ""),
+      description: String(item.snippet ?? item.text ?? "No preview available.").slice(0, 700),
+      age: typeof item.datePublished === "string" ? item.datePublished : undefined,
+      source: "LangSearch"
+    })).filter((item: Evidence) => {
+      try { return ["http:", "https:"].includes(new URL(item.url).protocol); }
+      catch { return false; }
+    });
+  } catch (error) {
+    console.error("LangSearch request failed:", error instanceof Error ? error.message : "Unknown error");
+    return [];
+  }
 }
 
 export async function POST(request: Request) {
@@ -166,54 +186,22 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Only public http:// and https:// URLs are supported." }, { status: 400 });
     }
 
-    const apiKey = process.env.GOOGLE_FACTCHECK_API_KEY;
-    let checks: Array<{ claim: string; claimant: string; publisher: string; rating: string; title: string; url: string; date: string }> = [];
-    let factCheckConfigured = Boolean(apiKey);
-    if (apiKey) {
-      const endpoint = new URL("https://factchecktools.googleapis.com/v1alpha1/claims:search");
-      endpoint.searchParams.set("query", query.slice(0, 500));
-      endpoint.searchParams.set("key", apiKey);
-      endpoint.searchParams.set("pageSize", "10");
-      const response = await fetch(endpoint.toString(), { cache: "no-store", signal: AbortSignal.timeout(8000) });
-      if (!response.ok) {
-        console.error("Fact Check API returned status", response.status);
-        if (response.status === 403) {
-          return NextResponse.json({ error: "Fact-check API access was denied. Check that the API is enabled and the key is valid." }, { status: 502 });
-        }
-        if (response.status === 429) return NextResponse.json({ error: "The fact-check service quota has been reached. Try again later." }, { status: 502 });
-        return NextResponse.json({ error: "The fact-check service is temporarily unavailable." }, { status: 502 });
-      }
-      const payload = await response.json();
-      const claims: FactCheck[] = payload.claims ?? [];
-      checks = claims.flatMap(claim => (claim.claimReview ?? []).map(review => ({
-        claim: claim.text ?? "Claim reviewed",
-        claimant: claim.claimant ?? "",
-        publisher: review.publisher?.name ?? "Fact-check publisher",
-        rating: review.textualRating ?? "Rating not provided",
-        title: review.title ?? "Read the fact-check",
-        url: review.url ?? "",
-        date: review.reviewDate ?? ""
-      }))).slice(0, 10);
-    }
+    // User-requested simple classification: any usable LangSearch result => REAL;
+    // no usable results => FAKE. This is a search-result rule, not independent fact verification.
+    const checks: Array<{ claim: string; claimant: string; publisher: string; rating: string; title: string; url: string; date: string }> = [];
+    const evidence = await searchLangSearch(`${query} fact check verification reliable sources`);
 
-    const evidence = await searchBrave(query);
-    let status = "unverified";
-    let verdict = "No matching fact-checks found";
-    let summary = factCheckConfigured
-      ? "No matching published fact-check was returned. This does not mean the story is true or false. Review the available source material and compare independent reporting."
-      : "Fact-check lookup is not configured. Add GOOGLE_FACTCHECK_API_KEY to search published reviews. This app will not guess whether a story is true or false.";
-    if (checks.length) {
-      status = "reviews_found";
-      verdict = "Published fact-checks found";
-      summary = `Found ${checks.length} published review result(s). Ratings apply to specific claims and context; read the original reviews before deciding what they mean.`;
-    } else if (evidence.length) {
-      verdict = "Related sources found — claim not yet verified";
-      summary = "Search results provide context to investigate, but search-result matches alone do not prove or disprove a claim.";
-    }
+    const status = evidence.length ? "real_sources_found" : "fake_no_sources";
+    const verdict = evidence.length
+      ? "REAL (Sources Found)"
+      : "FAKE (No Sources Found)";
+    const summary = evidence.length
+      ? "LangSearch returned one or more usable web sources. TruthLens labels this REAL (Sources Found) under your selected rule."
+      : "LangSearch returned no usable web sources. TruthLens labels this FAKE (No Sources Found) under your selected rule.";
 
     const result = {
       status, verdict, summary, checks, evidence,
-      input, isUrl, factCheckConfigured,
+      input, isUrl,
       article: article ? { url: article.finalUrl, title: article.title, text: article.text, site: article.site } : null,
       extractionNote
     };
