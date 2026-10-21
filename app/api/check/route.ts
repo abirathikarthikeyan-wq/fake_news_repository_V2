@@ -345,21 +345,12 @@ function isRelevantMatch(
 // These phrases may signal a correction or fact-check article.
 // They are not proof of a contradiction by themselves.
 function hasCorrectionLanguage(text: string): boolean {
-  return /\b(
-    false claim|
-    fact[\s-]?check|
-    debunked|
-    fabricated|
-    hoax|
-    misleading claim|
-    not true|
-    did not happen|
-    no evidence that|
-    officials denied|
-    statement is false|
-    claim is false|
-    incorrect claim
-  )\b/ix.test(text.replace(/\s+/g, " "));
+  const normalizedText = text.replace(/\s+/g, " ");
+
+  const correctionPattern =
+    /\b(false claim|fact[\s-]?check|debunked|fabricated|hoax|misleading claim|not true|did not happen|no evidence that|officials denied|statement is false|claim is false|incorrect claim)\b/i;
+
+  return correctionPattern.test(normalizedText);
 }
 
 // ------------------------------------------------------
